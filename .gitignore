@@ -1,0 +1,10 @@
+.venv/
+.env
+data/incoming/*.csv
+data/processed/*
+data/rejected/*
+data/archive/*
+!data/**/.gitkeep
+logs/*
+!logs/.gitkeep
+

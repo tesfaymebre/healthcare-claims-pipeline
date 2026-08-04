@@ -1,0 +1,16 @@
+database:
+  host: localhost
+  port: 5433
+  name: healthcare_claims
+  user: claims_user
+  # Prefer POSTGRES_PASSWORD from environment / .env over this default
+  password: claims_password
+
+pipeline:
+  name: healthcare_claims_pipeline
+  high_value_threshold: 10000.0
+  incoming_dir: data/incoming
+  processed_dir: data/processed
+  rejected_dir: data/rejected
+  archive_dir: data/archive
+  logs_dir: logs
