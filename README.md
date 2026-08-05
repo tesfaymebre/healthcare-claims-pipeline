@@ -13,7 +13,7 @@ Claims, operations, finance, and data-quality teams need a trusted PostgreSQL da
 
                      |
 
-              Python Ingestion -> add run_id, source_filename, ingestion_timestamp
+              Python Ingestion -> add source_filename, pipeline_run_id, and loaded_at
 
                        |
 
@@ -36,4 +36,20 @@ Fact Claims -> upsert on claim_id
       |
 
  Analytics
+```
+
+## PostgreSQL Data Model
+
+`stg_healthcare_claims`: Staging landing zone for cleaned rows before upsert
+`fact_claims`: Curated analytics table
+`rejected_claims`: for invalid rows
+`pipeline_audit`: Per-run counts, status, and errors
+
+- Schema script: [`sql/create_tables.sql`](sql/create_tables.sql)
+
+### Start the database
+
+```bash
+docker compose up -d
+# Tables are created automatically on first start via create_tables.sql
 ```
