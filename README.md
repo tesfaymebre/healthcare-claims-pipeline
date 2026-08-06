@@ -53,3 +53,15 @@ Fact Claims -> upsert on claim_id
 docker compose up -d
 # Tables are created automatically on first start via create_tables.sql
 ```
+
+## Synthetic Data
+
+Generate three claim CSV files (10k–20k total rows) with mostly valid data plus controlled defects for validation testing:
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python generate_claims.py --records 20000 --files 3
+```
+
+Output lands in `data/incoming/healthcare_claims_part_01.csv` … `_03.csv`. Defect types include missing fields, bad dates, negative amounts, invalid statuses, missing denial reasons, and business-key duplicates. All IDs are synthetic — no real PHI.

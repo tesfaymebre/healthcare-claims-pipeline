@@ -1,4 +1,6 @@
 .venv/
+__pycache__/
+*.pyc
 .env
 data/incoming/*.csv
 data/processed/*
@@ -7,4 +9,3 @@ data/archive/*
 !data/**/.gitkeep
 logs/*
 !logs/.gitkeep
-
