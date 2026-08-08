@@ -1,16 +1,77 @@
-database:
-  host: localhost
-  port: 5433
-  name: healthcare_claims
-  user: claims_user
-  # Prefer POSTGRES_PASSWORD from environment / .env over this default
-  password: claims_password
-
 pipeline:
   name: healthcare_claims_pipeline
-  high_value_threshold: 10000.0
-  incoming_dir: data/incoming
-  processed_dir: data/processed
-  rejected_dir: data/rejected
-  archive_dir: data/archive
-  logs_dir: logs
+  version: 1.0.0
+
+paths:
+  incoming: data/incoming
+  processed: data/processed
+  rejected: data/rejected
+  archive: data/archive
+  logs: logs
+
+validation:
+  high_value_threshold: 10000
+  late_submission_days: 90
+
+batch:
+  chunk_size: 5000
+  archive_after_success: true
+
+# Source CSV contract
+schema:
+  source_columns:
+    - claim_id
+    - patient_id
+    - provider_id
+    - service_date
+    - submission_date
+    - procedure_code
+    - diagnosis_code
+    - claim_type
+    - billed_amount
+    - approved_amount
+    - paid_amount
+    - claim_status
+    - denial_reason
+    - insurance_plan
+    - created_at
+
+  # Row-level required fields
+  required_fields:
+      - claim_id
+      - patient_id
+      - provider_id
+      - service_date
+      - submission_date
+      - billed_amount
+      - claim_status
+  
+  allowed_statuses:
+    - Submitted
+    - Pending
+    - Approved
+    - Denied
+    - Paid
+
+  allowed_claim_types:
+    - Medical
+    - Dental
+    - Pharmacy
+    - Vision
+
+  # Business key used for possible-duplicate detection
+  duplicate_key_fields:
+    - patient_id
+    - provider_id
+    - service_date
+    - procedure_code
+    - billed_amount
+
+  # Columns added during ingestion
+  lineage_columns:
+    - source_filename
+    - pipeline_run_id
+    - ingestion_timestamp
+  
+logging:
+  level: INFO

@@ -65,3 +65,14 @@ python generate_claims.py --records 20000 --files 3
 ```
 
 Output lands in `data/incoming/healthcare_claims_part_01.csv` … `_03.csv`. Defect types include missing fields, bad dates, negative amounts, invalid statuses, missing denial reasons, and business-key duplicates. All IDs are synthetic — no real PHI.
+
+## Ingestion
+
+Read all CSVs from `data/incoming`, skip empty or bad-schema files, and combine rows with lineage columns:
+
+```bash
+source .venv/bin/activate
+python "src/ingestion.py"
+```
+
+Adds `source_filename`, `pipeline_run_id`, and `ingestion_timestamp` to every row. Config comes from `config/settings.yaml` via `src/config.py`.
