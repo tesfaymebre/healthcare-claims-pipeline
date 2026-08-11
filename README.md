@@ -76,3 +76,28 @@ python "src/ingestion.py"
 ```
 
 Adds `source_filename`, `pipeline_run_id`, and `ingestion_timestamp` to every row. Config comes from `config/settings.yaml` via `src/config.py`.
+
+## Validation
+
+Data validation module for the healthcare claims pipeline.
+
+```bash
+python "src/validation.py"
+```
+
+- Validate required fields, dates, financial values, claim statuses, claim types, and denial rules
+- Detect possible duplicates, late submissions
+- Separate valid and rejected rocords
+- preserve rejection reasons and lineage information
+
+## Transformation
+
+Data transformation module for the healthcare claims pipeline.
+
+```bash
+python "src/transformation.py"
+```
+- Standardize data types needed for downstream processing.
+- Calculate processing_days and unpaid_amount.
+- Create is_approved flag, is_denied flag, and high_value_flag.
+- Preserve duplicate_flag from validation.
