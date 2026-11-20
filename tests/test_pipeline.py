@@ -4,6 +4,8 @@ from src.database import get_engine
 from src.loading import load_claims
 import pytest
 
+pytestmark = pytest.mark.db
+
 from src.database import transaction
 
 

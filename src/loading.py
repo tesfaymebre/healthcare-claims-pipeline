@@ -4,16 +4,22 @@ PostgreSQL loading module for the healthcare claims pipeline.
 The load runs as three steps inside a single transaction:
 
 1. Load validated records into stg_healthcare_claims.
-2. Merge them into fact_claims, deriving the calculated fields on the way in.
+2. Merge them into fact_claims, deriving the calculated fields on the way in,
+   and append each insert or real change to fact_claims_history.
 3. Recompute duplicate_flag across all loaded history.
+
+The same transaction records the run's source files as LOADED, so file-level
+lineage can never claim a file landed when its rows were rolled back.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 from sqlalchemy import text
@@ -21,9 +27,10 @@ from sqlalchemy.engine import Connection
 
 from .config import Settings, get_settings
 from .database import get_engine, transaction
-from .ingestion import load_all_files
-from .transformation import STAGING_COLUMNS, transform_claims
-from .validation import print_validation_summary, validate_claims
+from .transformation import STAGING_COLUMNS
+
+if TYPE_CHECKING:
+    from .ingestion import SourceFile
 
 
 class LoadingError(Exception):
@@ -71,12 +78,14 @@ INSERT INTO rejected_claims (
     rejection_reason,
     raw_record,
     source_filename,
+    source_row_number,
     pipeline_run_id
 ) VALUES (
     :claim_id,
     :rejection_reason,
     CAST(:raw_record AS JSONB),
     :source_filename,
+    :source_row_number,
     :pipeline_run_id
 )
 """
@@ -94,7 +103,13 @@ WHERE s.pipeline_run_id = :run_id
 # legitimately restate are refreshed. If a source ever did restate a billed
 # amount, the CHECK constraints would abort the batch, which is the loud
 # failure we want rather than a silently inconsistent row.
+#
+# The merge runs inside a data-modifying CTE so that the history rows are
+# written by the same statement, from exactly the rows the upsert touched.
+# Unchanged rows are filtered out by the WHERE on the conflict branch and so
+# produce no history, which keeps reruns from inflating it.
 MERGE_FACT_SQL = """
+WITH merged AS (
 INSERT INTO fact_claims (
     claim_id,
     patient_id,
@@ -118,6 +133,7 @@ INSERT INTO fact_claims (
     late_submission_flag,
     duplicate_flag,
     source_filename,
+    source_row_number,
     pipeline_run_id
 )
 SELECT
@@ -146,6 +162,7 @@ SELECT
     -- can see the whole history a duplicate is defined against.
     FALSE,
     s.source_filename,
+    s.source_row_number,
     s.pipeline_run_id
 FROM (
     SELECT DISTINCT ON (s.claim_id)
@@ -170,6 +187,7 @@ SET
     late_submission_flag = EXCLUDED.late_submission_flag,
     denial_reason = EXCLUDED.denial_reason,
     source_filename = EXCLUDED.source_filename,
+    source_row_number = EXCLUDED.source_row_number,
     pipeline_run_id = EXCLUDED.pipeline_run_id,
     updated_at = CURRENT_TIMESTAMP
 WHERE
@@ -182,7 +200,42 @@ WHERE
     OR fact_claims.denial_reason IS DISTINCT FROM EXCLUDED.denial_reason
     OR fact_claims.high_value_flag IS DISTINCT FROM EXCLUDED.high_value_flag
     OR fact_claims.late_submission_flag IS DISTINCT FROM EXCLUDED.late_submission_flag
-RETURNING (xmax::TEXT::BIGINT = 0) AS was_inserted
+RETURNING
+    claim_id,
+    claim_status,
+    approved_amount,
+    paid_amount,
+    denial_reason,
+    source_filename,
+    source_row_number,
+    pipeline_run_id,
+    (xmax::TEXT::BIGINT = 0) AS was_inserted
+),
+history AS (
+    INSERT INTO fact_claims_history (
+        claim_id,
+        change_type,
+        claim_status,
+        approved_amount,
+        paid_amount,
+        denial_reason,
+        source_filename,
+        source_row_number,
+        pipeline_run_id
+    )
+    SELECT
+        claim_id,
+        CASE WHEN was_inserted THEN 'INSERT' ELSE 'UPDATE' END,
+        claim_status,
+        approved_amount,
+        paid_amount,
+        denial_reason,
+        source_filename,
+        source_row_number,
+        pipeline_run_id
+    FROM merged
+)
+SELECT was_inserted FROM merged
 """
 
 
@@ -243,27 +296,19 @@ FROM fact_claims
 """
 
 
+@dataclass
 class LoadResult:
+    run_id: str
+    staged: int = 0
+    rejected_by_validation: int = 0
+    merge_candidates: int = 0
+    inserted: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    duplicate_flags_changed: int = 0
 
-    def __init__(
-        self,
-        run_id: str,
-        staged: int = 0,
-        rejected_by_validation: int = 0,
-        merge_candidates: int = 0,
-        inserted: int = 0,
-        updated: int = 0,
-        unchanged: int = 0,
-        duplicate_flags_changed: int = 0,
-    ) -> None:
-        self.run_id = run_id
-        self.staged = staged
-        self.rejected_by_validation = rejected_by_validation
-        self.merge_candidates = merge_candidates
-        self.inserted = inserted
-        self.updated = updated
-        self.unchanged = unchanged
-        self.duplicate_flags_changed = duplicate_flags_changed
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def _to_json_safe(value: Any) -> Any:
@@ -314,6 +359,12 @@ def load_staging(
     # staged rows have to carry that same id. Trusting the frame's own column
     # would let a mismatch turn the merge into a silent no-op.
     staging_frame = staging_frame.assign(pipeline_run_id=run_id)
+
+    # Bind every staging column, so a caller that omits an optional one
+    # (source_row_number from a hand-built frame, say) gets NULL, not a
+    # missing-parameter error.
+    staging_frame = staging_frame.reindex(columns=STAGING_COLUMNS)
+    staging_frame = staging_frame.astype(object).where(staging_frame.notna(), None)
 
     records = staging_frame.to_dict(orient="records")
 
@@ -372,6 +423,9 @@ def load_rejected_records(
                 "raw_record": json.dumps(raw_record),
                 "source_filename": _to_json_safe(
                     row.get("source_filename")
+                ),
+                "source_row_number": _to_json_safe(
+                    row.get("source_row_number")
                 ),
                 "pipeline_run_id": run_id,
             }
@@ -439,6 +493,7 @@ def load_claims(
     rejected_frame: pd.DataFrame,
     run_id: str,
     settings: Settings | None = None,
+    source_files: Iterable[SourceFile] | None = None,
 ) -> LoadResult:
     """
     Run the whole load inside one transaction.
@@ -446,6 +501,8 @@ def load_claims(
     Nothing is visible to a reader until every step has succeeded, so a failure
     in the merge cannot leave staging populated and fact half-written.
     """
+
+    from .lineage import record_source_files
 
     settings = settings or get_settings()
 
@@ -488,6 +545,9 @@ def load_claims(
             connection,
             run_id,
         )
+
+        if source_files is not None:
+            record_source_files(connection, run_id, source_files, committed=True)
 
     return result
 
@@ -542,24 +602,9 @@ def print_load_summary(result: LoadResult) -> None:
 
 if __name__ == "__main__":
 
+    # The end-to-end run (ingest, validate, transform, load, audit, archive,
+    # lineage, alerts) lives in src/pipeline.py; this keeps the old entry
+    # point working.
+    from .pipeline import main
 
-
-    frame = load_all_files()
-
-    pipeline_run_id = str(frame["pipeline_run_id"].iloc[0])
-
-    validation_result = validate_claims(frame)
-
-    print_validation_summary(validation_result)
-
-    staging_records = transform_claims(
-        validation_result.valid_records
-    )
-
-    load_result = load_claims(
-        staging_frame=staging_records,
-        rejected_frame=validation_result.rejected_records,
-        run_id=pipeline_run_id,
-    )
-
-    print_load_summary(load_result)
+    raise SystemExit(main())

@@ -1,16 +1,15 @@
 """
 Data validation module for the healthcare claims pipeline.
 
-Responsibilities:
-1. Validate required fields.
-2. Validate dates.
-3. Validate financial values.
-4. Validate claim statuses and claim types.
-5. Validate status-dependent financial rules.
-6. Validate denial rules.
-7. Report possible duplicates within the current batch.
-8. Separate valid and rejected records.
-9. Preserve rejection reasons and lineage information.
+The rules themselves are configuration: config/validation_rules.yaml, parsed
+and evaluated by src/rules.py. This module orchestrates them:
+
+1. Check that every column a rule refers to exists.
+2. Evaluate every enabled rule as a vectorized mask.
+3. Combine reject-rule hits into a pipe-separated rejection reason.
+4. Count warn-rule hits without rejecting the row.
+5. Report possible duplicates within the current batch (flag, never reject).
+6. Separate valid and rejected records, keeping lineage columns intact.
 """
 
 from __future__ import annotations
@@ -21,6 +20,7 @@ from typing import Any
 import pandas as pd
 
 from .config import Settings, get_settings
+from .rules import RuleSet, evaluate_rule, get_rule_set
 
 
 class ValidationError(Exception):
@@ -45,632 +45,163 @@ class ValidationResult:
         self.summary = summary
 
 
-def _add_validation_columns(
+def _check_columns(
     dataframe: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Add columns used internally by the validation process.
-    """
-
-    dataframe = dataframe.copy()
-
-    dataframe["_validation_errors"] = [
-        [] for _ in range(len(dataframe))
-    ]
-
-    dataframe["batch_duplicate_flag"] = False
-
-    return dataframe
-
-
-def _add_error(
-    dataframe: pd.DataFrame,
-    mask: pd.Series,
-    error_code: str,
-) -> None:
-    """
-    Add a validation error code to every row matching the mask.
-
-    Multiple errors can be stored on the same record.
-    """
-
-    indexes = dataframe.index[mask]
-
-    for index in indexes:
-        dataframe.at[index, "_validation_errors"].append(
-            error_code
-        )
-
-
-def validate_required_fields(
-    dataframe: pd.DataFrame,
+    rule_set: RuleSet,
     settings: Settings,
 ) -> None:
-    """
-    A record is rejected when one or more required fields
-    are missing or empty.
-    """
+    """Fail fast, with every missing column named, before evaluating rules."""
 
-    required_fields = settings.required_fields
+    needed = rule_set.referenced_columns(settings) | set(settings.duplicate_key_fields)
 
-    invalid_rows = pd.Series(
-        False,
-        index=dataframe.index,
-    )
+    missing = sorted(needed - set(dataframe.columns))
 
-    for column in required_fields:
-
-        missing = (
-            dataframe[column].isna()
-            | dataframe[column]
-            .astype(str)
-            .str.strip()
-            .eq("")
+    if missing:
+        raise ValidationError(
+            "Columns referenced by validation rules are missing: "
+            + ", ".join(missing)
         )
 
-        invalid_rows |= missing
 
-    _add_error(
-        dataframe,
-        invalid_rows,
-        "MISSING_REQUIRED_FIELD",
-    )
-
-
-def validate_dates(
+def _evaluate(
     dataframe: pd.DataFrame,
-) -> None:
+    rule_set: RuleSet,
+    settings: Settings,
+) -> tuple[dict[str, pd.Series], dict[str, pd.Series]]:
     """
-    Validate service_date and submission_date.
+    Evaluate every active rule.
 
-    Rules:
-    1. Dates must be parseable.
-    2. submission_date cannot be before service_date.
-    3. Future service dates are rejected.
-    """
-
-    service_dates = pd.to_datetime(
-        dataframe["service_date"],
-        errors="coerce",
-    )
-
-    submission_dates = pd.to_datetime(
-        dataframe["submission_date"],
-        errors="coerce",
-    )
-
-    invalid_service_date = (
-        dataframe["service_date"].notna()
-        & service_dates.isna()
-    )
-
-    _add_error(
-        dataframe,
-        invalid_service_date,
-        "INVALID_SERVICE_DATE",
-    )
-
-    invalid_submission_date = (
-        dataframe["submission_date"].notna()
-        & submission_dates.isna()
-    )
-
-    _add_error(
-        dataframe,
-        invalid_submission_date,
-        "INVALID_SUBMISSION_DATE",
-    )
-
-    submission_before_service = (
-        service_dates.notna()
-        & submission_dates.notna()
-        & (submission_dates < service_dates)
-    )
-
-    _add_error(
-        dataframe,
-        submission_before_service,
-        "SUBMISSION_BEFORE_SERVICE",
-    )
-
-    today = pd.Timestamp.now(tz="UTC").normalize()
-
-    future_service_date = (
-        service_dates.notna()
-        & (
-            service_dates.dt.normalize()
-            > today.tz_localize(None)
-        )
-    )
-
-    _add_error(
-        dataframe,
-        future_service_date,
-        "FUTURE_SERVICE_DATE",
-    )
-
-
-def validate_financials(
-    dataframe: pd.DataFrame,
-) -> None:
-    """
-    Validate general financial rules.
-
-    Rules:
-    billed_amount > 0
-    approved_amount >= 0, when present
-    paid_amount >= 0, when present
-    approved_amount <= billed_amount, when both are present
-    paid_amount <= approved_amount, when both are present
-
-    Missing approved_amount and paid_amount are allowed here.
-    Their status-dependent requirements are handled separately
-    by validate_status_dependent_amounts().
+    Returns reject masks and warn masks keyed by code, in rule-file order.
+    Rules sharing a code are OR-ed, so a row carries each code at most once.
     """
 
-    billed = pd.to_numeric(
-        dataframe["billed_amount"],
-        errors="coerce",
-    )
+    reject: dict[str, pd.Series] = {}
+    warn: dict[str, pd.Series] = {}
 
-    approved = pd.to_numeric(
-        dataframe["approved_amount"],
-        errors="coerce",
-    )
+    for rule in rule_set.active_rules:
 
-    paid = pd.to_numeric(
-        dataframe["paid_amount"],
-        errors="coerce",
-    )
+        mask = evaluate_rule(dataframe, rule, settings)
 
-    invalid_billed = (
-        billed.isna()
-        | (billed <= 0)
-    )
+        target = reject if rule.severity == "reject" else warn
 
-    _add_error(
-        dataframe,
-        invalid_billed,
-        "INVALID_BILLED_AMOUNT",
-    )
+        target[rule.code] = target[rule.code] | mask if rule.code in target else mask
 
-    invalid_approved = (
-        approved.notna()
-        & (approved < 0)
-    )
-
-    _add_error(
-        dataframe,
-        invalid_approved,
-        "INVALID_APPROVED_AMOUNT",
-    )
-
-    invalid_paid = (
-        paid.notna()
-        & (paid < 0)
-    )
-
-    _add_error(
-        dataframe,
-        invalid_paid,
-        "INVALID_PAID_AMOUNT",
-    )
-
-    approved_exceeds_billed = (
-        billed.notna()
-        & approved.notna()
-        & (approved > billed)
-    )
-
-    _add_error(
-        dataframe,
-        approved_exceeds_billed,
-        "APPROVED_EXCEEDS_BILLED",
-    )
-
-    paid_exceeds_approved = (
-        paid.notna()
-        & approved.notna()
-        & (paid > approved)
-    )
-
-    _add_error(
-        dataframe,
-        paid_exceeds_approved,
-        "PAID_EXCEEDS_APPROVED",
-    )
+    return reject, warn
 
 
-def _is_missing_value(
-    series: pd.Series,
+def _join_codes(
+    masks: dict[str, pd.Series],
+    index: pd.Index,
 ) -> pd.Series:
     """
-    This checks the original source representation so that
-    an invalid non-numeric value is not confused
-    with a genuinely missing amount.
+    Build "CODE_A|CODE_B" per row, vectorized. Rows with no hits get None.
     """
 
-    return (
-        series.isna()
-        | series.astype(str).str.strip().eq("")
-    )
+    joined = pd.Series("", index=index, dtype=object)
 
+    for code, mask in masks.items():
+        joined = joined.where(~mask, joined + "|" + code)
 
-def validate_status_dependent_amounts(
-    dataframe: pd.DataFrame,
-) -> None:
-    """
-    Validate financial fields according to claim status.
+    joined = joined.str.lstrip("|")
 
-    Submitted:
-        approved_amount may be NULL.
-        paid_amount may be NULL.
-
-    Pending:
-        approved_amount may be NULL.
-        paid_amount may be NULL.
-
-    Approved:
-        approved_amount is required.
-        paid_amount may be NULL.
-
-    Paid:
-        approved_amount is required.
-        paid_amount is required.
-
-    Denied:
-        approved_amount may be NULL.
-        paid_amount may be NULL or 0.
-        paid_amount must never be positive.
-
-    Important:
-        NULL is not automatically converted to 0.
-        NULL and 0 have different meanings.
-    """
-
-    status = dataframe["claim_status"]
-
-    approved_missing = _is_missing_value(
-        dataframe["approved_amount"]
-    )
-
-    paid_missing = _is_missing_value(
-        dataframe["paid_amount"]
-    )
-
-    # Approved claims require approved_amount.
-
-    missing_approved_for_approved = (
-        status.eq("Approved")
-        & approved_missing
-    )
-
-    _add_error(
-        dataframe,
-        missing_approved_for_approved,
-        "MISSING_APPROVED_AMOUNT",
-    )
-
-    # Paid claims require approved_amount.
-
-    missing_approved_for_paid = (
-        status.eq("Paid")
-        & approved_missing
-    )
-
-    _add_error(
-        dataframe,
-        missing_approved_for_paid,
-        "MISSING_APPROVED_AMOUNT",
-    )
-
-    # Paid claims require paid_amount.
-
-    missing_paid_for_paid = (
-        status.eq("Paid")
-        & paid_missing
-    )
-
-    _add_error(
-        dataframe,
-        missing_paid_for_paid,
-        "MISSING_PAID_AMOUNT",
-    )
-
-    """
-    Denied claims cannot have a positive paid_amount.
-    - NULL is allowed.
-    - 0 is allowed.
-    - Positive values are rejected.
-    """
-
-    paid = pd.to_numeric(
-        dataframe["paid_amount"],
-        errors="coerce",
-    )
-
-    positive_paid_for_denied = (
-        status.eq("Denied")
-        & paid.notna()
-        & (paid > 0)
-    )
-
-    _add_error(
-        dataframe,
-        positive_paid_for_denied,
-        "INVALID_DENIED_PAID_AMOUNT",
-    )
-
-
-def validate_statuses(
-    dataframe: pd.DataFrame,
-    settings: Settings,
-) -> None:
-    """
-    Validate claim statuses against the configured
-    list of allowed statuses.
-    """
-
-    allowed_statuses = set(
-        settings.allowed_statuses
-    )
-
-    invalid_status = (
-        ~dataframe["claim_status"].isin(
-            allowed_statuses
-        )
-    )
-
-    _add_error(
-        dataframe,
-        invalid_status,
-        "INVALID_CLAIM_STATUS",
-    )
-
-
-def validate_claim_types(
-    dataframe: pd.DataFrame,
-    settings: Settings,
-) -> None:
-    """
-    Validate claim types against the configured
-    list of allowed claim types.
-    """
-
-    allowed_claim_types = set(
-        settings.allowed_claim_types
-    )
-
-    invalid_claim_type = (
-        dataframe["claim_type"].notna()
-        & ~dataframe["claim_type"].isin(
-            allowed_claim_types
-        )
-    )
-
-    _add_error(
-        dataframe,
-        invalid_claim_type,
-        "INVALID_CLAIM_TYPE",
-    )
-
-
-def validate_denial_rules(
-    dataframe: pd.DataFrame,
-) -> None:
-    """
-    Validate denial-specific business rules.
-
-    A denied claim must have a denial reason.
-    """
-
-    denied_without_reason = (
-        dataframe["claim_status"].eq("Denied")
-        & (
-            dataframe["denial_reason"].isna()
-            | (
-                dataframe["denial_reason"]
-                .astype(str)
-                .str.strip()
-                .eq("")
-            )
-        )
-    )
-
-    _add_error(
-        dataframe,
-        denied_without_reason,
-        "MISSING_DENIAL_REASON",
-    )
+    return joined.where(joined.ne(""), None)
 
 
 def detect_duplicates(
     dataframe: pd.DataFrame,
     settings: Settings,
-) -> None:
+) -> pd.Series:
     """
-    Report possible duplicates inside the current batch.
+    Flag possible duplicates inside the current batch.
 
-    Duplicate key fields:
-        patient_id
-        provider_id
-        service_date
-        procedure_code
-        billed_amount
-
-    Possible duplicates are flagged rather than rejected.
+    The key comes from schema.duplicate_key_fields. Possible duplicates are
+    flagged rather than rejected: without a rule naming the authoritative
+    record, dropping either copy could lose a legitimate claim. The flag that
+    reaches fact_claims is recomputed in SQL against all loaded history.
     """
 
-    duplicate_fields = settings.duplicate_key_fields
-
-    missing_columns = [
-        column
-        for column in duplicate_fields
-        if column not in dataframe.columns
-    ]
-
-    if missing_columns:
-        raise ValidationError(
-            "Duplicate detection columns missing: "
-            + ", ".join(missing_columns)
-        )
-
-    duplicate_mask = dataframe.duplicated(
-        subset=duplicate_fields,
+    return dataframe.duplicated(
+        subset=settings.duplicate_key_fields,
         keep=False,
-    )
-
-    dataframe.loc[
-        duplicate_mask,
-        "batch_duplicate_flag",
-    ] = True
-
-
-def _prepare_rejection_reason(
-    dataframe: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Convert the internal list of validation errors into
-    a readable pipe-separated string.
-    """
-
-    dataframe["rejection_reason"] = (
-        dataframe["_validation_errors"].apply(
-            lambda errors: "|".join(errors)
-            if errors
-            else None
-        )
-    )
-
-    return dataframe
-
-
-def _remove_internal_columns(
-    dataframe: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Remove columns used only internally during validation.
-    """
-
-    return dataframe.drop(
-        columns=["_validation_errors"],
-        errors="ignore",
     )
 
 
 def validate_claims(
     dataframe: pd.DataFrame,
     settings: Settings | None = None,
+    rule_set: RuleSet | None = None,
 ) -> ValidationResult:
     """
-    Run all validation rules.
+    Run all configured validation rules.
     """
 
     settings = settings or get_settings()
+
+    rule_set = rule_set or get_rule_set(settings.validation_rules_file)
 
     if dataframe.empty:
         raise ValidationError(
             "Cannot validate an empty DataFrame."
         )
 
-    dataframe = _add_validation_columns(
-        dataframe
-    )
+    _check_columns(dataframe, rule_set, settings)
 
-    # Rejection-level validation
+    dataframe = dataframe.copy()
 
-    validate_required_fields(
-        dataframe,
-        settings,
-    )
+    reject_masks, warn_masks = _evaluate(dataframe, rule_set, settings)
 
-    validate_dates(
-        dataframe
-    )
+    dataframe["batch_duplicate_flag"] = detect_duplicates(dataframe, settings)
 
-    validate_financials(
-        dataframe
-    )
+    reasons = _join_codes(reject_masks, dataframe.index)
 
-    validate_status_dependent_amounts(
-        dataframe
-    )
+    has_errors = reasons.notna()
 
-    validate_statuses(
-        dataframe,
-        settings,
-    )
+    rejected_records = dataframe.loc[has_errors].copy()
+    rejected_records["rejection_reason"] = reasons[has_errors]
 
-    validate_claim_types(
-        dataframe,
-        settings,
-    )
-
-    validate_denial_rules(
-        dataframe
-    )
-
-    #Flagging rules
-
-    detect_duplicates(
-        dataframe,
-        settings,
-    )
-
-    
-    # Separate valid and rejected records
-
-    has_errors = dataframe[
-        "_validation_errors"
-    ].apply(bool)
-
-    rejected_records = dataframe.loc[
-        has_errors
-    ].copy()
-
-    valid_records = dataframe.loc[
-        ~has_errors
-    ].copy()
-
-    # Prepare readable rejection reason
-
-    rejected_records = _prepare_rejection_reason(
-        rejected_records
-    )
-
-    # Extract possible duplicate records
+    valid_records = dataframe.loc[~has_errors].copy()
 
     duplicate_records = valid_records.loc[
         valid_records["batch_duplicate_flag"]
     ].copy()
 
-    
-    # Remove internal validation columns
+    # Warnings only matter on rows that survive; a rejected row's warnings
+    # would double-count it in the quality summary.
+    warning_counts = {
+        code: int((mask & ~has_errors).sum())
+        for code, mask in warn_masks.items()
+    }
 
-    valid_records = _remove_internal_columns(
-        valid_records
-    )
+    rule_hits = {
+        code: int(mask.sum())
+        for code, mask in reject_masks.items()
+    }
 
-    rejected_records = _remove_internal_columns(
-        rejected_records
-    )
-
-    duplicate_records = _remove_internal_columns(
-        duplicate_records
-    )
-
-
-    # Summary
-
-    duplicate_count = int(
-        dataframe["batch_duplicate_flag"].sum()
+    by_file = (
+        dataframe.assign(_rejected=has_errors)
+        .groupby("source_filename", dropna=False)["_rejected"]
+        .agg(received="size", rejected="sum")
+        if "source_filename" in dataframe.columns
+        else pd.DataFrame(columns=["received", "rejected"])
     )
 
     summary = {
         "records_received": len(dataframe),
         "records_valid": len(valid_records),
         "records_rejected": len(rejected_records),
-        "records_flagged_duplicate": duplicate_count,
+        "records_flagged_duplicate": int(dataframe["batch_duplicate_flag"].sum()),
+        "records_with_warnings": int(
+            pd.concat(warn_masks.values(), axis=1).any(axis=1).loc[~has_errors].sum()
+        )
+        if warn_masks
+        else 0,
+        "rule_hits": rule_hits,
+        "warning_hits": warning_counts,
+        "by_file": {
+            str(name): {"received": int(row.received), "rejected": int(row.rejected)}
+            for name, row in by_file.iterrows()
+        },
+        "rules_version": rule_set.version,
         "validation_timestamp": datetime.now(UTC),
     }
 
@@ -695,27 +226,23 @@ def print_validation_summary(
     print("=" * 60)
     print("VALIDATION SUMMARY")
     print("=" * 60)
-
-    print(
-        f"Records received:        "
-        f"{summary['records_received']:,}"
-    )
-
-    print(
-        f"Records valid:           "
-        f"{summary['records_valid']:,}"
-    )
-
-    print(
-        f"Records rejected:        "
-        f"{summary['records_rejected']:,}"
-    )
-
+    print(f"Records received:        {summary['records_received']:,}")
+    print(f"Records valid:           {summary['records_valid']:,}")
+    print(f"Records rejected:        {summary['records_rejected']:,}")
     print(
         f"Possible duplicates:     "
         f"{summary['records_flagged_duplicate']:,}"
         f"  (within this batch only)"
     )
+    print(f"Records with warnings:   {summary['records_with_warnings']:,}")
+
+    if summary["rule_hits"]:
+        print("-" * 60)
+        for code, hits in sorted(
+            summary["rule_hits"].items(), key=lambda item: -item[1]
+        ):
+            if hits:
+                print(f"  {code:<32}{hits:>8,}")
 
     print("=" * 60)
 
@@ -726,32 +253,9 @@ if __name__ == "__main__":
 
     dataframe = load_all_files()
 
-    result = validate_claims(
-        dataframe
-    )
+    result = validate_claims(dataframe)
 
-    print_validation_summary(
-        result
-    )
+    print_validation_summary(result)
 
     print("\nRejected records:")
-
-    print(
-        result.rejected_records[
-            [
-                "claim_id",
-                "rejection_reason",
-            ]
-        ].head(10)
-    )
-
-    print("\nPossible duplicate records:")
-
-    print(
-        result.duplicate_records[
-            [
-                "claim_id",
-                "batch_duplicate_flag",
-            ]
-        ].head(10)
-    )
+    print(result.rejected_records[["claim_id", "rejection_reason"]].head(10))
