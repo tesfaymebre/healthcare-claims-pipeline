@@ -17,7 +17,7 @@ import uuid
 
 import pandas as pd
 
-from config import get_settings
+from .config import get_settings
 
 
 
@@ -120,13 +120,20 @@ def enrich_metadata(
     return dataframe
 
 
-def load_all_files() -> pd.DataFrame:
+def load_all_files(
+    run_id: str | None = None,
+) -> pd.DataFrame:
     """
     Read every CSV file from the incoming directory
     and combine them into one DataFrame.
+
+    A run ID can be supplied so that retrying a failed run reuses the same
+    identifier. The loader deletes any staging and rejection rows carrying that
+    ID before writing, so a retry replaces the earlier attempt instead of
+    stacking a second copy beside it.
     """
 
-    run_id = uuid.uuid4().hex
+    run_id = run_id or uuid.uuid4().hex
 
     dataframes = []
 

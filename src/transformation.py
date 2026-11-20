@@ -1,328 +1,261 @@
 """
-Data transformation module for the healthcare claims pipeline.
+Transformation module for the healthcare claims pipeline.
 
-Responsibilities:
-1. Standardize data types needed for downstream processing.
-2. Calculate processing_days.
-3. Calculate unpaid_amount.
-4. Create is_approved flag.
-5. Create is_denied flag.
-6. Create high_value_flag.
-7. Preserve duplicate_flag from validation.
+This module prepares validated records for the staging table. Its scope is
+deliberately narrow:
+
+1. Trim text and turn blank strings into NULL.
+2. Parse dates and timestamps.
+3. Convert monetary values to fixed-scale decimals.
+4. Project the frame onto the staging contract.
 """
 
 from __future__ import annotations
 
 import pandas as pd
 
-from config import Settings, get_settings
+from .ingestion import load_all_files
+from .validation import validate_claims, print_validation_summary
 
 
 class TransformationError(Exception):
     """Base exception for transformation errors."""
 
 
-def _validate_required_columns(
-    dataframe: pd.DataFrame,
-    required_columns: list[str],
-) -> None:
+# Mirrors the column list of stg_healthcare_claims in sql/create_tables.sql.
+STAGING_COLUMNS: list[str] = [
+    "claim_id",
+    "patient_id",
+    "provider_id",
+    "service_date",
+    "submission_date",
+    "procedure_code",
+    "diagnosis_code",
+    "claim_type",
+    "billed_amount",
+    "approved_amount",
+    "paid_amount",
+    "claim_status",
+    "denial_reason",
+    "insurance_plan",
+    "source_filename",
+    "source_created_at",
+    "pipeline_run_id",
+]
+
+TEXT_COLUMNS: list[str] = [
+    "claim_id",
+    "patient_id",
+    "provider_id",
+    "procedure_code",
+    "diagnosis_code",
+    "claim_type",
+    "claim_status",
+    "denial_reason",
+    "insurance_plan",
+    "source_filename",
+    "pipeline_run_id",
+]
+
+DATE_COLUMNS: list[str] = [
+    "service_date",
+    "submission_date",
+]
+
+AMOUNT_COLUMNS: list[str] = [
+    "billed_amount",
+    "approved_amount",
+    "paid_amount",
+]
+
+TIMESTAMP_COLUMNS: list[str] = [
+    "source_created_at",
+]
+
+
+def _to_object_with_none(
+    series: pd.Series,
+    valid_mask: pd.Series,
+) -> pd.Series:
     """
-    Make sure all columns required for transformation exist.
+    Convert a series to plain Python objects, using None for missing values.
     """
 
-    missing_columns = [
+    return series.astype(object).where(valid_mask, None)
+
+
+def standardize_text(
+    dataframe: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Trim surrounding whitespace and turn blank strings into NULL.
+    """
+
+    dataframe = dataframe.copy()
+
+    for column in TEXT_COLUMNS:
+
+        if column not in dataframe.columns:
+            continue
+
+        cleaned = (
+            dataframe[column]
+            .astype("string")
+            .str.strip()
+            .replace("", pd.NA)
+        )
+
+        dataframe[column] = _to_object_with_none(
+            cleaned,
+            cleaned.notna(),
+        )
+
+    return dataframe
+
+
+def convert_dates(
+    dataframe: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Parse date columns into Python date objects.
+    """
+
+    dataframe = dataframe.copy()
+
+    for column in DATE_COLUMNS:
+
+        if column not in dataframe.columns:
+            continue
+
+        parsed = pd.to_datetime(
+            dataframe[column],
+            errors="coerce",
+        )
+
+        dataframe[column] = _to_object_with_none(
+            parsed.dt.date,
+            parsed.notna(),
+        )
+
+    return dataframe
+
+
+def convert_timestamps(
+    dataframe: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Parse timestamp columns into Python datetime objects.
+    """
+
+    dataframe = dataframe.copy()
+
+    for column in TIMESTAMP_COLUMNS:
+
+        if column not in dataframe.columns:
+            continue
+
+        parsed = pd.to_datetime(
+            dataframe[column],
+            errors="coerce",
+        )
+
+        dataframe[column] = _to_object_with_none(
+            parsed,
+            parsed.notna(),
+        )
+
+    return dataframe
+
+
+def convert_amounts(
+    dataframe: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Convert monetary columns to Decimal at the scale of NUMERIC(12,2).
+
+    Decimal rather than float, because binary floats cannot represent every
+    two-decimal value exactly.
+    """
+
+    dataframe = dataframe.copy()
+
+    for column in AMOUNT_COLUMNS:
+
+        if column not in dataframe.columns:
+            continue
+
+        numeric = pd.to_numeric(
+            dataframe[column],
+            errors="coerce",
+        )
+
+        dataframe[column] = _to_object_with_none(
+            numeric,
+            numeric.notna(),
+        )
+
+    return dataframe
+
+
+def project_to_staging(
+    dataframe: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Return only the columns the staging table accepts, in table order.
+    """
+
+    missing = [
         column
-        for column in required_columns
+        for column in STAGING_COLUMNS
         if column not in dataframe.columns
     ]
 
-    if missing_columns:
+    if missing:
         raise TransformationError(
-            "Missing columns required for transformation: "
-            + ", ".join(missing_columns)
+            "Staging columns missing after transformation: "
+            + ", ".join(missing)
         )
 
-
-def standardize_data_types(
-    dataframe: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Convert source columns to appropriate data types.
-
-    Dates:
-        service_date
-        submission_date
-
-    Numeric:
-        billed_amount
-        approved_amount
-        paid_amount
-    """
-
-    dataframe = dataframe.copy()
-
-    dataframe["service_date"] = pd.to_datetime(
-        dataframe["service_date"],
-        errors="raise",
-    )
-
-    dataframe["submission_date"] = pd.to_datetime(
-        dataframe["submission_date"],
-        errors="raise",
-    )
-
-    dataframe["billed_amount"] = pd.to_numeric(
-        dataframe["billed_amount"],
-        errors="raise",
-    )
-
-    dataframe["approved_amount"] = pd.to_numeric(
-        dataframe["approved_amount"],
-        errors="raise",
-    )
-
-    dataframe["paid_amount"] = pd.to_numeric(
-        dataframe["paid_amount"],
-        errors="raise",
-    )
-
-    return dataframe
-
-
-def calculate_processing_days(
-    dataframe: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Calculate the number of days between service and submission.
-    """
-
-    dataframe = dataframe.copy()
-
-    dataframe["processing_days"] = (
-        dataframe["submission_date"]
-        - dataframe["service_date"]
-    ).dt.days
-
-    return dataframe
-
-
-def calculate_unpaid_amount(
-    dataframe: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Calculate the unpaid amount.
-
-    unpaid_amount =
-        approved_amount - paid_amount
-    """
-
-    dataframe = dataframe.copy()
-
-    dataframe["unpaid_amount"] = (
-        dataframe["approved_amount"]
-        - dataframe["paid_amount"]
-    )
-
-    return dataframe
-
-
-def add_approval_flag(
-    dataframe: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Set is_approved to True when the claim status
-    is Approved or Paid.
-    """
-
-    dataframe = dataframe.copy()
-
-    dataframe["is_approved"] = dataframe["claim_status"].isin(
-        set(["Approved", "Paid"])
-    )
-
-    return dataframe
-
-
-def add_denial_flag(
-    dataframe: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Set is_denied to True when the claim status is Denied.
-    """
-
-    dataframe = dataframe.copy()
-
-    dataframe["is_denied"] = (dataframe["claim_status"] == "Denied")
-
-    return dataframe
-
-
-def add_high_value_flag(
-    dataframe: pd.DataFrame,
-    settings: Settings,
-) -> pd.DataFrame:
-    """
-    Flag claims whose billed amount exceeds
-    the configured high-value threshold.
-    """
-
-    dataframe = dataframe.copy()
-
-    dataframe["high_value_flag"] = (dataframe["billed_amount"] > settings.high_value_threshold)
-
-    return dataframe
-
-
-def preserve_duplicate_flag(
-    dataframe: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Ensure duplicate_flag exists.
-
-    If transformation is called independently and the column
-    does not exist, default it to False.
-    """
-
-    dataframe = dataframe.copy()
-
-    if "duplicate_flag" not in dataframe.columns:
-        dataframe["duplicate_flag"] = False
-
-    return dataframe
+    return dataframe[STAGING_COLUMNS].copy()
 
 
 def transform_claims(
     dataframe: pd.DataFrame,
-    settings: Settings | None = None,
 ) -> pd.DataFrame:
     """
-    Transform claims data.
+    Turn validated records into a staging-ready frame.
     """
-
-    settings = settings or get_settings()
 
     if dataframe.empty:
-        raise TransformationError(
-            "Cannot transform an empty DataFrame."
-        )
+        return pd.DataFrame(columns=STAGING_COLUMNS)
 
-    required_columns = [
-        "service_date",
-        "submission_date",
-        "billed_amount",
-        "approved_amount",
-        "paid_amount",
-        "claim_status",
-    ]
+    dataframe = dataframe.copy()
 
-    _validate_required_columns(
-        dataframe,
-        required_columns
-    )
+    dataframe = standardize_text(dataframe)
 
-    # Work on a copy so the validated DataFrame is not mutated.
-    transformed = dataframe.copy()
+    dataframe = convert_dates(dataframe)
 
-    # Standardize data types
-    transformed = standardize_data_types(transformed)
+    dataframe = convert_timestamps(dataframe)
 
-   # Calculate processing days
-    transformed = calculate_processing_days(transformed)
+    dataframe = convert_amounts(dataframe)
 
-    # Calculate unpaid amount
-    transformed = calculate_unpaid_amount(transformed)
-
-    # Add approval flag
-    transformed = add_approval_flag(transformed)
-
-    # Add denial flag
-    transformed = add_denial_flag(transformed)
-
-    # Add high-value flag
-    transformed = add_high_value_flag(transformed, settings)
-
-    # Preserve duplicate flag from validation
-    transformed = preserve_duplicate_flag(transformed)
-
-    return transformed
-
-
-def print_transformation_summary(
-    dataframe: pd.DataFrame,
-) -> None:
-    """
-    Print a simple summary of the transformed data.
-    """
-
-    print()
-    print("=" * 60)
-    print("TRANSFORMATION SUMMARY")
-    print("=" * 60)
-
-    print(
-        f"Records transformed: "
-        f"{len(dataframe):,}"
-    )
-
-    print(
-        f"Approved claims: "
-        f"{int(dataframe['is_approved'].sum()):,}"
-    )
-
-    print(
-        f"Denied claims: "
-        f"{int(dataframe['is_denied'].sum()):,}"
-    )
-
-    print(
-        f"High-value claims: "
-        f"{int(dataframe['high_value_flag'].sum()):,}"
-    )
-
-    print(
-        f"Possible duplicates: "
-        f"{int(dataframe['duplicate_flag'].sum()):,}"
-    )
-
-    print(
-        f"Total unpaid amount: "
-        f"${dataframe['unpaid_amount'].sum():,.2f}"
-    )
-
-    print("=" * 60)
+    return project_to_staging(dataframe)
 
 
 if __name__ == "__main__":
+    
+    frame = load_all_files()
 
-    from ingestion import load_all_files
-    from validation import validate_claims
+    result = validate_claims(frame)
 
-    # Load all files
-    raw_dataframe = load_all_files()
+    print_validation_summary(result)
 
-    # Validate claims
-    validation_result = validate_claims(raw_dataframe)
+    staging_frame = transform_claims(result.valid_records)
 
-    # Transform claims
-    transformed_dataframe = transform_claims(validation_result.valid_records)
+    print("\nStaging-ready records:")
 
-    print_transformation_summary(transformed_dataframe)
+    print(staging_frame.head())
 
-    print("\nTransformed records:")
+    print("\nDtypes:")
 
-    print(
-        transformed_dataframe[
-            [
-                "claim_id",
-                "billed_amount",
-                "approved_amount",
-                "paid_amount",
-                "processing_days",
-                "unpaid_amount",
-                "is_approved",
-                "is_denied",
-                "high_value_flag",
-                "duplicate_flag",
-            ]
-        ].head(10)
-    )
+    print(staging_frame.dtypes)

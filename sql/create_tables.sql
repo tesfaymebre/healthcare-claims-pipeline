@@ -1,4 +1,4 @@
-# Schema for the staging table
+-- Schema for the staging table
 CREATE TABLE IF NOT EXISTS stg_healthcare_claims (
     claim_id VARCHAR(50), 
     patient_id VARCHAR(50), 
@@ -14,12 +14,13 @@ CREATE TABLE IF NOT EXISTS stg_healthcare_claims (
     claim_status VARCHAR(20),
     denial_reason VARCHAR(255), 
     insurance_plan VARCHAR(50),
+    source_created_at TIMESTAMP,
     source_filename VARCHAR(255), 
     pipeline_run_id VARCHAR(50),
     loaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-# Schema for the fact table
+-- Schema for the fact table
 CREATE TABLE IF NOT EXISTS fact_claims (
     claim_key BIGSERIAL PRIMARY KEY,
     claim_id VARCHAR(50) UNIQUE NOT NULL,
@@ -40,7 +41,8 @@ CREATE TABLE IF NOT EXISTS fact_claims (
     processing_days INTEGER, 
     is_approved BOOLEAN, 
     is_denied BOOLEAN,
-    high_value_flag BOOLEAN, 
+    high_value_flag BOOLEAN,
+    late_submission_flag BOOLEAN, 
     duplicate_flag BOOLEAN,
     source_filename VARCHAR(255), 
     pipeline_run_id VARCHAR(50),
@@ -51,7 +53,7 @@ CREATE TABLE IF NOT EXISTS fact_claims (
         CHECK (submission_date >= service_date),
     CONSTRAINT chk_fact_claims_billed_amount_positive
         CHECK (billed_amount > 0),
-    CONSTRAINT chk_fact_claims_apporoved_non_negative
+    CONSTRAINT chk_fact_claims_approved_non_negative
         CHECK (approved_amount IS NULL OR approved_amount >= 0),
     CONSTRAINT chk_fact_claims_paid_non_negative
         CHECK (paid_amount IS NULL OR paid_amount >= 0),
@@ -61,9 +63,30 @@ CREATE TABLE IF NOT EXISTS fact_claims (
         CHECK (approved_amount IS NULL OR paid_amount IS NULL OR approved_amount >= paid_amount),
     CONSTRAINT chk_fact_claims_status
         CHECK (claim_status IN ('Submitted', 'Pending', 'Approved', 'Denied', 'Paid')),
+    CONSTRAINT chk_fact_claims_approved_amount_required
+    CHECK (
+        claim_status <> 'Approved'
+        OR approved_amount IS NOT NULL
+    ),
+    CONSTRAINT chk_fact_claims_paid_amounts_required
+        CHECK (
+            claim_status <> 'Paid'
+            OR (
+                approved_amount IS NOT NULL
+                AND paid_amount IS NOT NULL
+            )
+        ),
+
+    CONSTRAINT chk_fact_claims_denied_paid_amount
+        CHECK (
+            claim_status <> 'Denied'
+            OR paid_amount IS NULL
+            OR paid_amount = 0
+        )
 );
 
-# Schema for rejected claims table
+
+-- Schema for rejected claims table
 
 CREATE TABLE IF NOT EXISTS rejected_claims (
     rejection_id BIGSERIAL PRIMARY KEY, 
@@ -75,7 +98,7 @@ CREATE TABLE IF NOT EXISTS rejected_claims (
     rejected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-# Schema for audit table
+-- Schema for audit table
 CREATE TABLE IF NOT EXISTS pipeline_audit (
     pipeline_run_id VARCHAR(50) PRIMARY KEY, 
     pipeline_name VARCHAR(100),
@@ -92,36 +115,3 @@ CREATE TABLE IF NOT EXISTS pipeline_audit (
     CONSTRAINT chk_pipeline_audit_status
         CHECK (run_status IS NULL OR run_status IN ('RUNNING', 'SUCCESS', 'FAILED', 'PARTIAL'))
 );
-
-# Indexes for fact table
-CREATE INDEX IF NOT EXISTS idx_fact_claims_status
-    ON fact_claims (claim_status);
-
-CREATE INDEX IF NOT EXISTS idx_fact_claims_provider
-    ON fact_claims (provider_id);
-
-CREATE INDEX IF NOT EXISTS idx_fact_claims_service_date
-    ON fact_claims (service_date);
-
-CREATE INDEX IF NOT EXISTS idx_fact_claims_patient
-    ON fact_claims (patient_id);
-
-CREATE INDEX IF NOT EXISTS idx_fact_claims_run_id
-    ON fact_claims (pipeline_run_id);
-
-# Indexes for rejected claims table
-CREATE INDEX IF NOT EXISTS idx_rejected_claims_run_id
-    ON rejected_claims (pipeline_run_id);
-
-CREATE INDEX IF NOT EXISTS idx_rejected_claims_claim_id
-    ON rejected_claims (claim_id);
-
-CREATE INDEX IF NOT EXISTS idx_rejected_claims_rejected_at
-    ON rejected_claims (rejected_at);
-
-# Indexes for pipeline audit table
-CREATE INDEX IF NOT EXISTS idx_pipeline_audit_status
-    ON pipeline_audit (run_status);
-
-CREATE INDEX IF NOT EXISTS idx_pipeline_audit_start
-    ON pipeline_audit (run_start_time);

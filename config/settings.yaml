@@ -34,7 +34,7 @@ schema:
     - claim_status
     - denial_reason
     - insurance_plan
-    - created_at
+    - source_created_at
 
   # Row-level required fields
   required_fields:
