@@ -68,7 +68,21 @@ class Settings:
 
         self._load_logging()
 
+        self._load_ingestion()
+
+        self._load_lineage()
+
+        self._load_alerting()
+
+        self._load_api()
+
         self.database = self._load_database()
+
+    @property
+    def raw_config(self) -> dict:
+        """The parsed settings.yaml, for rules that reference lists by path."""
+
+        return self._config
 
     # Load YAML configuration
     def _load_yaml(self):
@@ -120,6 +134,10 @@ class Settings:
 
         self.late_submission_days = int(validation.get("late_submission_days", 90))
 
+        self.validation_rules_file = PROJECT_ROOT / validation.get(
+            "rules_file", "config/validation_rules.yaml"
+        )
+
     # Load batch configuration
     def _load_batch(self):
 
@@ -163,6 +181,90 @@ class Settings:
         logging_config = self._config["logging"]
 
         self.log_level = logging_config.get("level", "INFO").upper()
+
+    # The sections below were added after the original contract, so each is
+    # optional and falls back to safe defaults when absent.
+
+    def _load_ingestion(self):
+
+        ingestion = self._config.get("ingestion") or {}
+
+        self.skip_previously_loaded_files = bool(
+            ingestion.get("skip_previously_loaded_files", True)
+        )
+
+    def _load_lineage(self):
+
+        lineage = self._config.get("lineage") or {}
+
+        self.lineage_enabled = bool(lineage.get("enabled", True))
+
+        self.lineage_namespace = str(lineage.get("namespace", "healthcare_claims"))
+
+        self.lineage_transport = str(lineage.get("transport", "file")).lower()
+
+        if self.lineage_transport not in {"file", "http", "none"}:
+            raise ValueError(
+                f"lineage.transport must be file, http or none, got {self.lineage_transport!r}"
+            )
+
+        self.lineage_dir = PROJECT_ROOT / lineage.get("file_dir", "logs/lineage")
+
+        self.openlineage_url = os.getenv("OPENLINEAGE_URL")
+
+    def _load_alerting(self):
+
+        alerting = self._config.get("alerting") or {}
+
+        channels = alerting.get("channels") or {}
+
+        thresholds = alerting.get("thresholds") or {}
+
+        self.alerting_enabled = bool(alerting.get("enabled", True))
+
+        self.alert_min_severity = str(alerting.get("min_severity", "WARNING")).upper()
+
+        self.alert_webhook_enabled = bool(channels.get("webhook", False))
+
+        self.alert_email_enabled = bool(channels.get("email", False))
+
+        self.max_rejection_rate = float(thresholds.get("max_rejection_rate", 0.15))
+
+        self.max_duplicate_rate = float(thresholds.get("max_duplicate_rate", 0.10))
+
+        self.min_volume_ratio = float(thresholds.get("min_volume_ratio", 0.5))
+
+        self.volume_lookback_runs = int(thresholds.get("volume_lookback_runs", 5))
+
+        # Secrets stay in the environment.
+        self.alert_webhook_url = os.getenv("ALERT_WEBHOOK_URL")
+
+        self.smtp_host = os.getenv("SMTP_HOST")
+
+        self.smtp_port = int(os.getenv("SMTP_PORT", "587"))
+
+        self.smtp_user = os.getenv("SMTP_USER")
+
+        self.smtp_password = os.getenv("SMTP_PASSWORD")
+
+        self.alert_email_from = os.getenv("ALERT_EMAIL_FROM")
+
+        self.alert_email_to = [
+            address.strip()
+            for address in os.getenv("ALERT_EMAIL_TO", "").split(",")
+            if address.strip()
+        ]
+
+    def _load_api(self):
+
+        api = self._config.get("api") or {}
+
+        self.api_default_page_size = int(api.get("default_page_size", 50))
+
+        self.api_max_page_size = int(api.get("max_page_size", 500))
+
+        # Optional. When set, every /api/v1 request must send X-API-Key.
+        self.api_key = os.getenv("API_KEY") or None
 
     
     # Require environment variable

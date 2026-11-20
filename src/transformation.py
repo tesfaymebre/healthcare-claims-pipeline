@@ -12,10 +12,9 @@ deliberately narrow:
 
 from __future__ import annotations
 
-import pandas as pd
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
-from .ingestion import load_all_files
-from .validation import validate_claims, print_validation_summary
+import pandas as pd
 
 
 class TransformationError(Exception):
@@ -39,9 +38,14 @@ STAGING_COLUMNS: list[str] = [
     "denial_reason",
     "insurance_plan",
     "source_filename",
+    "source_row_number",
     "source_created_at",
     "pipeline_run_id",
 ]
+
+# Lineage columns the pipeline always adds, but that a hand-built frame (a
+# test, a backfill) may lack. They become NULL rather than an error.
+OPTIONAL_STAGING_COLUMNS: set[str] = {"source_row_number"}
 
 TEXT_COLUMNS: list[str] = [
     "claim_id",
@@ -71,6 +75,30 @@ AMOUNT_COLUMNS: list[str] = [
 TIMESTAMP_COLUMNS: list[str] = [
     "source_created_at",
 ]
+
+_CENT = Decimal("0.01")
+
+
+def _to_decimal(value: object) -> Decimal | None:
+    """
+    Parse one amount into a Decimal at two decimal places, or None.
+
+    Parsing the source text directly ("746.97") keeps the value exact; going
+    through float first would not.
+    """
+
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return None
+
+    try:
+        amount = Decimal(str(value).strip())
+    except InvalidOperation:
+        return None
+
+    if not amount.is_finite():
+        return None
+
+    return amount.quantize(_CENT, rounding=ROUND_HALF_UP)
 
 
 def _to_object_with_none(
@@ -184,15 +212,7 @@ def convert_amounts(
         if column not in dataframe.columns:
             continue
 
-        numeric = pd.to_numeric(
-            dataframe[column],
-            errors="coerce",
-        )
-
-        dataframe[column] = _to_object_with_none(
-            numeric,
-            numeric.notna(),
-        )
+        dataframe[column] = dataframe[column].map(_to_decimal).astype(object)
 
     return dataframe
 
@@ -208,6 +228,7 @@ def project_to_staging(
         column
         for column in STAGING_COLUMNS
         if column not in dataframe.columns
+        and column not in OPTIONAL_STAGING_COLUMNS
     ]
 
     if missing:
@@ -216,7 +237,9 @@ def project_to_staging(
             + ", ".join(missing)
         )
 
-    return dataframe[STAGING_COLUMNS].copy()
+    return dataframe.reindex(columns=STAGING_COLUMNS).astype(object).where(
+        lambda frame: frame.notna(), None
+    )
 
 
 def transform_claims(
@@ -243,7 +266,10 @@ def transform_claims(
 
 
 if __name__ == "__main__":
-    
+
+    from .ingestion import load_all_files
+    from .validation import print_validation_summary, validate_claims
+
     frame = load_all_files()
 
     result = validate_claims(frame)

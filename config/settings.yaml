@@ -12,6 +12,14 @@ paths:
 validation:
   high_value_threshold: 10000
   late_submission_days: 90
+  # Declarative data-quality rules (see the file for the rule format).
+  rules_file: config/validation_rules.yaml
+
+ingestion:
+  # File-level duplicate control: a file whose SHA-256 matches a file that was
+  # already loaded successfully is skipped and recorded, not reprocessed.
+  # Override for one run with: python -m src.pipeline --force-reprocess
+  skip_previously_loaded_files: true
 
 batch:
   chunk_size: 5000
@@ -70,8 +78,39 @@ schema:
   # Columns added during ingestion
   lineage_columns:
     - source_filename
+    - source_row_number
     - pipeline_run_id
     - ingestion_timestamp
   
 logging:
   level: INFO
+
+# Data lineage. Row level: every staged, rejected and fact row carries
+# source_filename, source_row_number and pipeline_run_id. File level: the
+# source_files table. Run level: OpenLineage events (START/COMPLETE/FAIL).
+lineage:
+  enabled: true
+  namespace: healthcare_claims
+  # file: one JSON line per event under file_dir (works offline).
+  # http: POST to OPENLINEAGE_URL (e.g. Marquez); falls back to file on error.
+  # none: no OpenLineage events (tables are still populated).
+  transport: file
+  file_dir: logs/lineage
+
+# Alerting. Every alert is logged and stored in pipeline_alerts. Webhook and
+# email are opt-in; their secrets come from .env, never from this file.
+alerting:
+  enabled: true
+  min_severity: WARNING        # INFO | WARNING | CRITICAL
+  channels:
+    webhook: false             # ALERT_WEBHOOK_URL (Slack-compatible)
+    email: false               # SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, ALERT_EMAIL_FROM, ALERT_EMAIL_TO
+  thresholds:
+    max_rejection_rate: 0.15   # rejected / received
+    max_duplicate_rate: 0.10   # flagged duplicates / received
+    min_volume_ratio: 0.50     # received vs. average of recent successful runs
+    volume_lookback_runs: 5
+
+api:
+  default_page_size: 50
+  max_page_size: 500

@@ -1,7 +1,24 @@
+# Pipeline
 numpy>=1.26.0
 pandas>=2.0.0
 psycopg[binary]>=3.1.0
 SQLAlchemy>=2.0.0
-pytest>=7.0.0
 PyYAML>=6.0.0
 python-dotenv>=1.0.0
+pydantic>=2.7.0
+
+# REST API
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# Dashboard
+streamlit>=1.40.0
+altair>=5.0.0
+
+# Testing
+pytest>=7.0.0
+httpx>=0.27.0
+
+# Airflow is deliberately not listed: it runs in its own container
+# (docker compose --profile airflow up -d). Installing it into this
+# environment would pin many of the packages above to Airflow's constraints.

@@ -1,0 +1,14 @@
+[project]
+name = "healthcare-claims-pipeline"
+version = "1.0.0"
+description = "Batch pipeline for synthetic healthcare claims: Python, pandas and PostgreSQL."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "db: needs the PostgreSQL database from .env (skipped automatically when it is unreachable)",
+]
+filterwarnings = [
+    "ignore:Using `httpx` with `starlette.testclient`",
+]

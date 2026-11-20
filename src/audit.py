@@ -15,8 +15,8 @@ from datetime import datetime, timezone
 
 from sqlalchemy import text
 
-from config import Settings, get_settings
-from database import transaction
+from .config import Settings, get_settings
+from .database import get_engine, transaction
 
 
 LOGGER_NAME = "healthcare_claims_pipeline"
@@ -32,6 +32,12 @@ INSERT INTO pipeline_audit (
     records_loaded,
     records_rejected,
     records_flagged_duplicate,
+    records_inserted,
+    records_updated,
+    records_unchanged,
+    files_received,
+    files_rejected,
+    files_skipped,
     run_status,
     error_message
 )
@@ -45,6 +51,12 @@ VALUES (
     :records_loaded,
     :records_rejected,
     :records_flagged_duplicate,
+    :records_inserted,
+    :records_updated,
+    :records_unchanged,
+    :files_received,
+    :files_rejected,
+    :files_skipped,
     :run_status,
     :error_message
 )
@@ -52,14 +64,32 @@ ON CONFLICT (pipeline_run_id) DO UPDATE
 SET
     pipeline_name = EXCLUDED.pipeline_name,
     source_filename = EXCLUDED.source_filename,
-    run_start_time = EXCLUDED.run_start_time,
+    -- A retry keeps the original start time, so duration covers every attempt.
+    run_start_time = COALESCE(pipeline_audit.run_start_time, EXCLUDED.run_start_time),
     run_end_time = EXCLUDED.run_end_time,
     records_received = EXCLUDED.records_received,
     records_loaded = EXCLUDED.records_loaded,
     records_rejected = EXCLUDED.records_rejected,
     records_flagged_duplicate = EXCLUDED.records_flagged_duplicate,
+    records_inserted = EXCLUDED.records_inserted,
+    records_updated = EXCLUDED.records_updated,
+    records_unchanged = EXCLUDED.records_unchanged,
+    files_received = EXCLUDED.files_received,
+    files_rejected = EXCLUDED.files_rejected,
+    files_skipped = EXCLUDED.files_skipped,
     run_status = EXCLUDED.run_status,
     error_message = EXCLUDED.error_message
+"""
+
+
+RECENT_VOLUMES_SQL = """
+SELECT records_received
+FROM pipeline_audit
+WHERE run_status = 'SUCCESS'
+  AND pipeline_run_id <> :run_id
+  AND records_received > 0
+ORDER BY run_start_time DESC
+LIMIT :limit
 """
 
 
@@ -118,14 +148,25 @@ def record_audit(
     source_filename: str | None,
     run_start_time: datetime,
     run_end_time: datetime | None,
-    records_received: int,
-    records_loaded: int,
-    records_rejected: int,
-    records_flagged_duplicate: int,
+    records_received: int | None,
+    records_loaded: int | None,
+    records_rejected: int | None,
+    records_flagged_duplicate: int | None,
     run_status: str,
     error_message: str | None = None,
+    records_inserted: int | None = None,
+    records_updated: int | None = None,
+    records_unchanged: int | None = None,
+    files_received: int | None = None,
+    files_rejected: int | None = None,
+    files_skipped: int | None = None,
 ) -> None:
-    """Insert or update one pipeline audit record."""
+    """
+    Insert or update one pipeline audit record.
+
+    Written in its own transaction, separate from the load, so a FAILED
+    record survives the rollback of the work it describes.
+    """
 
     with transaction() as connection:
         connection.execute(
@@ -140,10 +181,27 @@ def record_audit(
                 "records_loaded": records_loaded,
                 "records_rejected": records_rejected,
                 "records_flagged_duplicate": records_flagged_duplicate,
+                "records_inserted": records_inserted,
+                "records_updated": records_updated,
+                "records_unchanged": records_unchanged,
+                "files_received": files_received,
+                "files_rejected": files_rejected,
+                "files_skipped": files_skipped,
                 "run_status": run_status,
                 "error_message": error_message,
             },
         )
+
+
+def recent_volumes(run_id: str, limit: int) -> list[int]:
+    """records_received of the most recent successful runs, excluding this one."""
+
+    with get_engine().connect() as connection:
+        rows = connection.execute(
+            text(RECENT_VOLUMES_SQL),
+            {"run_id": run_id, "limit": limit},
+        ).scalars()
+        return [int(value) for value in rows]
 
 
 def utc_now() -> datetime:

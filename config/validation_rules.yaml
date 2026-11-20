@@ -1,0 +1,162 @@
+# Declarative data-quality rules for the claims pipeline.
+#
+# The rule engine (src/rules.py) reads this file, checks it against a strict
+# schema before any data is touched, and turns each rule into a vectorized
+# pandas check. A typo in a rule type, column or operator fails the run at
+# startup, not halfway through a batch.
+#
+# Common keys
+#   code         Error code written to rejected_claims.rejection_reason.
+#                Several rules may share a code; a row gets the code once.
+#   type         One of: required, must_be_empty, date_parseable,
+#                not_future_date, numeric, compare, allowed_values.
+#   severity     reject (default): the row goes to rejected_claims.
+#                warn: the row is kept and the hit is counted in the
+#                quality summary only.
+#   enabled      Set to false to switch a rule off without deleting it.
+#   when         Optional condition: the rule only applies to rows where
+#                <column> is one of <in>.
+#   description  Free text, shown in the quality summary and the dashboard.
+#
+# values_from lets a rule reuse a list from settings.yaml, e.g.
+# "schema.allowed_statuses", so the list is defined in exactly one place.
+#
+# Rules run in file order, and the order of codes in a rejection reason
+# follows it, so keep related rules together.
+#
+# Note: fact_claims has CHECK constraints that mirror the reject rules.
+# Disabling a reject rule here does not let bad rows into the fact table;
+# the database refuses them and the load rolls back. Change both together.
+
+version: 1
+
+rules:
+
+  # Completeness
+
+  - code: MISSING_REQUIRED_FIELD
+    type: required
+    # No columns listed: uses schema.required_fields from settings.yaml.
+    description: One or more required fields are absent or blank.
+
+  # Dates
+
+  - code: INVALID_SERVICE_DATE
+    type: date_parseable
+    column: service_date
+    description: service_date is present but cannot be parsed.
+
+  - code: INVALID_SUBMISSION_DATE
+    type: date_parseable
+    column: submission_date
+    description: submission_date is present but cannot be parsed.
+
+  - code: SUBMISSION_BEFORE_SERVICE
+    type: compare
+    as: date
+    left: submission_date
+    op: "<"
+    right_column: service_date
+    description: The claim was submitted before the service took place.
+
+  - code: FUTURE_SERVICE_DATE
+    type: not_future_date
+    column: service_date
+    description: The service date is later than today (UTC).
+
+  # Financials
+
+  - code: INVALID_BILLED_AMOUNT
+    type: numeric
+    column: billed_amount
+    min: 0
+    min_inclusive: false
+    allow_missing: false
+    description: billed_amount must be a number greater than zero.
+
+  - code: INVALID_APPROVED_AMOUNT
+    type: numeric
+    column: approved_amount
+    min: 0
+    allow_missing: true
+    description: approved_amount, when present, must be a non-negative number.
+
+  - code: INVALID_PAID_AMOUNT
+    type: numeric
+    column: paid_amount
+    min: 0
+    allow_missing: true
+    description: paid_amount, when present, must be a non-negative number.
+
+  - code: APPROVED_EXCEEDS_BILLED
+    type: compare
+    as: number
+    left: approved_amount
+    op: ">"
+    right_column: billed_amount
+    description: The approved amount is larger than the billed amount.
+
+  - code: PAID_EXCEEDS_APPROVED
+    type: compare
+    as: number
+    left: paid_amount
+    op: ">"
+    right_column: approved_amount
+    description: The paid amount is larger than the approved amount.
+
+  # Status-dependent financial rules. NULL and 0 mean different things, so
+  # a missing amount is never treated as zero.
+
+  - code: MISSING_APPROVED_AMOUNT
+    type: required
+    columns: [approved_amount]
+    when: {column: claim_status, in: [Approved, Paid]}
+    description: Approved and paid claims must carry an approved amount.
+
+  - code: MISSING_PAID_AMOUNT
+    type: required
+    columns: [paid_amount]
+    when: {column: claim_status, in: [Paid]}
+    description: Paid claims must carry a paid amount.
+
+  - code: INVALID_DENIED_PAID_AMOUNT
+    type: compare
+    as: number
+    left: paid_amount
+    op: ">"
+    right_value: 0
+    when: {column: claim_status, in: [Denied]}
+    description: A denied claim cannot have a positive paid amount.
+
+  # Domain values
+
+  - code: INVALID_CLAIM_STATUS
+    type: allowed_values
+    column: claim_status
+    values_from: schema.allowed_statuses
+    allow_missing: false
+    description: claim_status is not one of the allowed statuses.
+
+  - code: INVALID_CLAIM_TYPE
+    type: allowed_values
+    column: claim_type
+    values_from: schema.allowed_claim_types
+    allow_missing: true
+    description: claim_type is not one of the allowed claim types.
+
+  # Denial rules
+
+  - code: MISSING_DENIAL_REASON
+    type: required
+    columns: [denial_reason]
+    when: {column: claim_status, in: [Denied]}
+    description: A denied claim must state a denial reason.
+
+  # Warnings: kept in the fact table, counted in the quality summary.
+
+  - code: DENIAL_REASON_ON_APPROVED_CLAIM
+    type: must_be_empty
+    columns: [denial_reason]
+    when: {column: claim_status, in: [Approved, Paid]}
+    severity: warn
+    description: Approved or paid claims should not normally carry a denial reason.

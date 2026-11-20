@@ -21,5 +21,71 @@ services:
       retries: 10
       start_period: 10s
 
+  # Airflow (opt-in): docker compose --profile airflow up -d
+  # UI at http://localhost:8080. Single-container "standalone" mode is meant
+  # for development; production splits scheduler, API server, DAG processor
+  # and workers into separate services.
+
+  # Airflow keeps its own metadata in a separate "airflow" database on the
+  # same server, never in the claims database.
+  airflow-init-db:
+    image: postgres:16-alpine
+    profiles: ["airflow"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    entrypoint:
+      - sh
+      - -c
+      - >
+        psql -h postgres -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -tAc
+        "SELECT 1 FROM pg_database WHERE datname = 'airflow'" | grep -q 1
+        || psql -h postgres -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -c "CREATE DATABASE airflow"
+    restart: "no"
+
+  airflow:
+    # The official image already ships every library the pipeline imports
+    # (pandas, SQLAlchemy 2, psycopg 3, PyYAML, pydantic, python-dotenv). If
+    # you add a dependency, build FROM this image and install it with the
+    # Airflow constraints file rather than a bare pip install.
+    image: apache/airflow:3.3.2-python3.12
+    container_name: healthcare-claims-airflow
+    profiles: ["airflow"]
+    command: standalone
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init-db:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      # The pipeline reaches Postgres over the compose network.
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      PYTHONPATH: /opt/airflow/project
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/project/dags
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      # Local development only: every UI user is an admin, no login.
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./:/opt/airflow/project
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8080/api/v2/monitor/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+
 volumes:
   postgres_data:
