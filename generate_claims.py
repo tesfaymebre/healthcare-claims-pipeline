@@ -153,7 +153,7 @@ def generate_base_claims(
                 "claim_status": claim_status,
                 "denial_reason": denial_reason,
                 "insurance_plan": random.choice(INSURANCE_PLANS),
-                "created_at": submission_date.strftime(
+                "source_created_at": submission_date.strftime(
                     "%Y-%m-%d %H:%M:%S"
                 ),
             }

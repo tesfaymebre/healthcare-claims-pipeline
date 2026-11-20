@@ -6,9 +6,9 @@ Responsibilities:
 2. Validate dates.
 3. Validate financial values.
 4. Validate claim statuses and claim types.
-5. Validate denial rules.
-6. Detect possible duplicates.
-7. Detect late submissions.
+5. Validate status-dependent financial rules.
+6. Validate denial rules.
+7. Report possible duplicates within the current batch.
 8. Separate valid and rejected records.
 9. Preserve rejection reasons and lineage information.
 """
@@ -20,7 +20,7 @@ from typing import Any
 
 import pandas as pd
 
-from config import Settings, get_settings
+from .config import Settings, get_settings
 
 
 class ValidationError(Exception):
@@ -45,18 +45,20 @@ class ValidationResult:
         self.summary = summary
 
 
-def _add_validation_columns(dataframe: pd.DataFrame) -> pd.DataFrame:
+def _add_validation_columns(
+    dataframe: pd.DataFrame,
+) -> pd.DataFrame:
     """
     Add columns used internally by the validation process.
     """
 
     dataframe = dataframe.copy()
 
-    dataframe["_validation_errors"] = [[] for _ in range(len(dataframe))]
+    dataframe["_validation_errors"] = [
+        [] for _ in range(len(dataframe))
+    ]
 
-    dataframe["duplicate_flag"] = False
-
-    dataframe["late_submission_flag"] = False
+    dataframe["batch_duplicate_flag"] = False
 
     return dataframe
 
@@ -68,13 +70,16 @@ def _add_error(
 ) -> None:
     """
     Add a validation error code to every row matching the mask.
+
     Multiple errors can be stored on the same record.
     """
 
     indexes = dataframe.index[mask]
 
     for index in indexes:
-        dataframe.at[index, "_validation_errors"].append(error_code)
+        dataframe.at[index, "_validation_errors"].append(
+            error_code
+        )
 
 
 def validate_required_fields(
@@ -97,7 +102,10 @@ def validate_required_fields(
 
         missing = (
             dataframe[column].isna()
-            | dataframe[column].astype(str).str.strip().eq("")
+            | dataframe[column]
+            .astype(str)
+            .str.strip()
+            .eq("")
         )
 
         invalid_rows |= missing
@@ -169,7 +177,10 @@ def validate_dates(
 
     future_service_date = (
         service_dates.notna()
-        & (service_dates.dt.normalize() > today.tz_localize(None))
+        & (
+            service_dates.dt.normalize()
+            > today.tz_localize(None)
+        )
     )
 
     _add_error(
@@ -183,14 +194,18 @@ def validate_financials(
     dataframe: pd.DataFrame,
 ) -> None:
     """
-    Validate financial values.
+    Validate general financial rules.
 
     Rules:
     billed_amount > 0
-    approved_amount >= 0
-    paid_amount >= 0
-    approved_amount <= billed_amount
-    paid_amount <= approved_amount
+    approved_amount >= 0, when present
+    paid_amount >= 0, when present
+    approved_amount <= billed_amount, when both are present
+    paid_amount <= approved_amount, when both are present
+
+    Missing approved_amount and paid_amount are allowed here.
+    Their status-dependent requirements are handled separately
+    by validate_status_dependent_amounts().
     """
 
     billed = pd.to_numeric(
@@ -266,6 +281,127 @@ def validate_financials(
     )
 
 
+def _is_missing_value(
+    series: pd.Series,
+) -> pd.Series:
+    """
+    This checks the original source representation so that
+    an invalid non-numeric value is not confused
+    with a genuinely missing amount.
+    """
+
+    return (
+        series.isna()
+        | series.astype(str).str.strip().eq("")
+    )
+
+
+def validate_status_dependent_amounts(
+    dataframe: pd.DataFrame,
+) -> None:
+    """
+    Validate financial fields according to claim status.
+
+    Submitted:
+        approved_amount may be NULL.
+        paid_amount may be NULL.
+
+    Pending:
+        approved_amount may be NULL.
+        paid_amount may be NULL.
+
+    Approved:
+        approved_amount is required.
+        paid_amount may be NULL.
+
+    Paid:
+        approved_amount is required.
+        paid_amount is required.
+
+    Denied:
+        approved_amount may be NULL.
+        paid_amount may be NULL or 0.
+        paid_amount must never be positive.
+
+    Important:
+        NULL is not automatically converted to 0.
+        NULL and 0 have different meanings.
+    """
+
+    status = dataframe["claim_status"]
+
+    approved_missing = _is_missing_value(
+        dataframe["approved_amount"]
+    )
+
+    paid_missing = _is_missing_value(
+        dataframe["paid_amount"]
+    )
+
+    # Approved claims require approved_amount.
+
+    missing_approved_for_approved = (
+        status.eq("Approved")
+        & approved_missing
+    )
+
+    _add_error(
+        dataframe,
+        missing_approved_for_approved,
+        "MISSING_APPROVED_AMOUNT",
+    )
+
+    # Paid claims require approved_amount.
+
+    missing_approved_for_paid = (
+        status.eq("Paid")
+        & approved_missing
+    )
+
+    _add_error(
+        dataframe,
+        missing_approved_for_paid,
+        "MISSING_APPROVED_AMOUNT",
+    )
+
+    # Paid claims require paid_amount.
+
+    missing_paid_for_paid = (
+        status.eq("Paid")
+        & paid_missing
+    )
+
+    _add_error(
+        dataframe,
+        missing_paid_for_paid,
+        "MISSING_PAID_AMOUNT",
+    )
+
+    """
+    Denied claims cannot have a positive paid_amount.
+    - NULL is allowed.
+    - 0 is allowed.
+    - Positive values are rejected.
+    """
+
+    paid = pd.to_numeric(
+        dataframe["paid_amount"],
+        errors="coerce",
+    )
+
+    positive_paid_for_denied = (
+        status.eq("Denied")
+        & paid.notna()
+        & (paid > 0)
+    )
+
+    _add_error(
+        dataframe,
+        positive_paid_for_denied,
+        "INVALID_DENIED_PAID_AMOUNT",
+    )
+
+
 def validate_statuses(
     dataframe: pd.DataFrame,
     settings: Settings,
@@ -275,9 +411,15 @@ def validate_statuses(
     list of allowed statuses.
     """
 
-    allowed_statuses = set(settings.allowed_statuses)
+    allowed_statuses = set(
+        settings.allowed_statuses
+    )
 
-    invalid_status = ~dataframe["claim_status"].isin(allowed_statuses)
+    invalid_status = (
+        ~dataframe["claim_status"].isin(
+            allowed_statuses
+        )
+    )
 
     _add_error(
         dataframe,
@@ -295,7 +437,9 @@ def validate_claim_types(
     list of allowed claim types.
     """
 
-    allowed_claim_types = set(settings.allowed_claim_types)
+    allowed_claim_types = set(
+        settings.allowed_claim_types
+    )
 
     invalid_claim_type = (
         dataframe["claim_type"].notna()
@@ -317,18 +461,19 @@ def validate_denial_rules(
     """
     Validate denial-specific business rules.
 
-    Rules:
-    1. A denied claim must have a denial reason.
-    2. Approved/Paid claims containing a denial reason
-    are not rejected because the specification describes
-    this as a 'normally should not' condition.
+    A denied claim must have a denial reason.
     """
 
     denied_without_reason = (
-        (dataframe["claim_status"] == "Denied")
+        dataframe["claim_status"].eq("Denied")
         & (
             dataframe["denial_reason"].isna()
-            | (dataframe["denial_reason"].astype(str).str.strip() == "")
+            | (
+                dataframe["denial_reason"]
+                .astype(str)
+                .str.strip()
+                .eq("")
+            )
         )
     )
 
@@ -344,7 +489,7 @@ def detect_duplicates(
     settings: Settings,
 ) -> None:
     """
-    Detect possible duplicates.
+    Report possible duplicates inside the current batch.
 
     Duplicate key fields:
         patient_id
@@ -377,43 +522,7 @@ def detect_duplicates(
 
     dataframe.loc[
         duplicate_mask,
-        "duplicate_flag",
-    ] = True
-
-
-def detect_late_submissions(
-    dataframe: pd.DataFrame,
-    settings: Settings,
-) -> None:
-    """
-    Flag claims submitted more than the configured
-    number of days after the service date.
-
-    Late submissions are flagged, not rejected.
-    """
-
-    service_dates = pd.to_datetime(
-        dataframe["service_date"],
-        errors="coerce",
-    )
-
-    submission_dates = pd.to_datetime(
-        dataframe["submission_date"],
-        errors="coerce",
-    )
-
-    processing_days = (
-        submission_dates - service_dates
-    ).dt.days
-
-    late_mask = (
-        processing_days.notna()
-        & (processing_days > settings.late_submission_days)
-    )
-
-    dataframe.loc[
-        late_mask,
-        "late_submission_flag",
+        "batch_duplicate_flag",
     ] = True
 
 
@@ -425,10 +534,12 @@ def _prepare_rejection_reason(
     a readable pipe-separated string.
     """
 
-    dataframe["rejection_reason"] = dataframe["_validation_errors"].apply(
-        lambda errors: "|".join(errors)
-        if errors
-        else None
+    dataframe["rejection_reason"] = (
+        dataframe["_validation_errors"].apply(
+            lambda errors: "|".join(errors)
+            if errors
+            else None
+        )
     )
 
     return dataframe
@@ -468,30 +579,45 @@ def validate_claims(
 
     # Rejection-level validation
 
-    validate_required_fields(dataframe,settings)
+    validate_required_fields(
+        dataframe,
+        settings,
+    )
 
-    validate_dates(dataframe)
+    validate_dates(
+        dataframe
+    )
 
-    validate_financials(dataframe)
+    validate_financials(
+        dataframe
+    )
 
-    validate_statuses(dataframe,settings)
+    validate_status_dependent_amounts(
+        dataframe
+    )
 
-    validate_claim_types(dataframe,settings)
+    validate_statuses(
+        dataframe,
+        settings,
+    )
 
-    validate_denial_rules(dataframe)
+    validate_claim_types(
+        dataframe,
+        settings,
+    )
 
-    # Flagging rules
+    validate_denial_rules(
+        dataframe
+    )
+
+    #Flagging rules
 
     detect_duplicates(
         dataframe,
         settings,
     )
 
-    detect_late_submissions(
-        dataframe,
-        settings,
-    )
-
+    
     # Separate valid and rejected records
 
     has_errors = dataframe[
@@ -508,14 +634,17 @@ def validate_claims(
 
     # Prepare readable rejection reason
 
-    rejected_records = _prepare_rejection_reason(rejected_records)
+    rejected_records = _prepare_rejection_reason(
+        rejected_records
+    )
 
     # Extract possible duplicate records
 
     duplicate_records = valid_records.loc[
-        valid_records["duplicate_flag"]
+        valid_records["batch_duplicate_flag"]
     ].copy()
 
+    
     # Remove internal validation columns
 
     valid_records = _remove_internal_columns(
@@ -530,14 +659,11 @@ def validate_claims(
         duplicate_records
     )
 
-    # summary
+
+    # Summary
 
     duplicate_count = int(
-        dataframe["duplicate_flag"].sum()
-    )
-
-    late_submission_count = int(
-        dataframe["late_submission_flag"].sum()
+        dataframe["batch_duplicate_flag"].sum()
     )
 
     summary = {
@@ -545,9 +671,6 @@ def validate_claims(
         "records_valid": len(valid_records),
         "records_rejected": len(rejected_records),
         "records_flagged_duplicate": duplicate_count,
-        "records_flagged_late_submission": (
-            late_submission_count
-        ),
         "validation_timestamp": datetime.now(UTC),
     }
 
@@ -591,11 +714,7 @@ def print_validation_summary(
     print(
         f"Possible duplicates:     "
         f"{summary['records_flagged_duplicate']:,}"
-    )
-
-    print(
-        f"Late submissions:        "
-        f"{summary['records_flagged_late_submission']:,}"
+        f"  (within this batch only)"
     )
 
     print("=" * 60)
@@ -603,15 +722,20 @@ def print_validation_summary(
 
 if __name__ == "__main__":
 
-    from ingestion import load_all_files
+    from .ingestion import load_all_files
 
     dataframe = load_all_files()
 
-    result = validate_claims(dataframe)
+    result = validate_claims(
+        dataframe
+    )
 
-    print_validation_summary(result)
+    print_validation_summary(
+        result
+    )
 
     print("\nRejected records:")
+
     print(
         result.rejected_records[
             [
@@ -622,11 +746,12 @@ if __name__ == "__main__":
     )
 
     print("\nPossible duplicate records:")
+
     print(
         result.duplicate_records[
             [
                 "claim_id",
-                "duplicate_flag",
+                "batch_duplicate_flag",
             ]
         ].head(10)
     )
